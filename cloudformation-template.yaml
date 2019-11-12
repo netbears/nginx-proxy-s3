@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: A CloudFormation template to deploy an NGiNX Proxy for an S3 bucket (typically used with an internal load balancer)
+
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  SubnetContainer:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Use at least 2
+
+  SubnetLoadBalancer:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Use at least 2
+
+  LoadBalancerType:
+    Type: String
+    Default: internal
+    AllowedValues:
+      - internal
+      - internet-facing
+
+  SslLoadBalancer:
+    Type: String
+
+  Image:
+    Type: String
+    Default: netbears/nginx-proxy-s3:latest
+
+  DnsZone:
+    Type: AWS::Route53::HostedZone::Id
+
+  DnsRecord:
+    Type: String
+
+  GenerateDnsRecord:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  S3Bucket:
+    Type: String
+
+  DnsResolver:
+    Type: String
+
+Conditions:
+  DeployDnsRecord:
+    Fn::Equals:
+      - Ref: GenerateDnsRecord
+      - 'true'
+
+Resources:
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: LogGroup
+    Properties:
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 0.5GB
+      ExecutionRoleArn:
+        Fn::GetAtt: ExecutionRole.Arn
+      TaskRoleArn:
+        Fn::GetAtt: TaskRole.Arn
+      ContainerDefinitions:
+        - Name: nginx-proxy-s3
+          Image:
+            Ref: Image
+          PortMappings:
+            - ContainerPort: 80
+          Environment:
+            - Name: S3BUCKET
+              Value:
+                Ref: S3Bucket
+            - Name: HOSTNAME
+              Value:
+                Ref: DnsRecord
+            - Name: DNS
+              Value:
+                Ref: DnsResolver
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region:
+                Ref: AWS::Region
+              awslogs-group:
+                Ref: LogGroup
+              awslogs-stream-prefix: ecs
+
+  # A role needed by ECS
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${AWS::StackName}-ExecutionRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  # A role for the containers
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: ${AWS::StackName}-TaskRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription:
+        Fn::Sub: ${AWS::StackName}-ContainerSecurityGroup
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId:
+            Ref: LoadBalancerSecurityGroup
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription:
+        Fn::Sub: ${AWS::StackName}-LoadBalancerSecurityGroup
+      VpcId:
+        Ref: VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerHTTPS
+    Properties: 
+      Cluster:
+        Ref: Cluster
+      TaskDefinition:
+        Ref: TaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 1
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      NetworkConfiguration: 
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            Ref: SubnetContainer
+          SecurityGroups:
+            - Ref: ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: nginx-proxy-s3
+          ContainerPort: 80
+          TargetGroupArn:
+            Ref: TargetGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /status
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+      TargetType: ip
+      VpcId:
+        Ref: VpcId
+
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn:
+            Ref: TargetGroup
+          Type: forward
+      LoadBalancerArn:
+        Ref: LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn:
+            Ref: TargetGroup
+          Type: forward
+      LoadBalancerArn:
+        Ref: LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn:
+            Ref: SslLoadBalancer
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      LoadBalancerAttributes:
+        # this is the default, but is specified here in case it needs to be changed
+        - Key: idle_timeout.timeout_seconds
+          Value: 30
+      Scheme:
+        Ref: LoadBalancerType
+      SecurityGroups:
+        - Ref: LoadBalancerSecurityGroup
+      Subnets:
+        Ref: SubnetLoadBalancer
+
+  Route53Record:
+    Type: AWS::Route53::RecordSetGroup
+    Condition: DeployDnsRecord
+    Properties:
+      HostedZoneId:
+        Ref: DnsZone
+      Comment: 
+        Fn::Sub: Route53-record-for-NginxProxyS3
+      RecordSets:
+      - Name:
+          Ref: DnsRecord
+        Type: A
+        AliasTarget:
+          HostedZoneId: 
+            Fn::GetAtt:
+              - LoadBalancer
+              - CanonicalHostedZoneID
+          DNSName: 
+            Fn::GetAtt:
+              - LoadBalancer
+              - DNSName
+  
+Outputs:
+  Endpoint:
+    Description: Endpoint
+    Value:
+      Fn::Sub: "https://${DnsRecord}"
