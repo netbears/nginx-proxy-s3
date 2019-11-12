@@ -177,7 +177,7 @@ Resources:
       LaunchType: FARGATE
       NetworkConfiguration: 
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
+          AssignPublicIp: DISABLED
           Subnets:
             Ref: SubnetContainer
           SecurityGroups:
